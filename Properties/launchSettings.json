@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "dx_function": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7056",
+      "launchBrowser": false
+    }
+  }
+}
