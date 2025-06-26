@@ -1,6 +1,7 @@
-using System;
-using Microsoft.Data.SqlClient;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
+using Microsoft.Data.SqlClient;
 using Azure.Messaging.EventHubs;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
@@ -11,18 +12,26 @@ namespace Mizobata.Function
     {
         private readonly ILogger<DXFunction> _logger;
         private readonly string? _connectionString;
+        private readonly HttpClient _httpClient;
+        private readonly string? _mlEndpoint;
+        private readonly string? _mlApiKey;
 
         public DXFunction(ILogger<DXFunction> logger)
         {
             _logger = logger;
             _connectionString = Environment.GetEnvironmentVariable("ADO_NET_CONNECTION");
-            if (string.IsNullOrEmpty(_connectionString)) {
-                throw new InvalidOperationException("Missing ADO_NET_CONNECTION in environment variables.");
-            }
+            _mlEndpoint = Environment.GetEnvironmentVariable("ML_ENDPOINT_URL");
+            _mlApiKey = Environment.GetEnvironmentVariable("ML_API_KEY");
+
+            if (string.IsNullOrEmpty(_connectionString) || string.IsNullOrEmpty(_mlEndpoint) || string.IsNullOrEmpty(_mlApiKey))
+                throw new InvalidOperationException("Missing required environment variables.");
+
+            _httpClient = new HttpClient();
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _mlApiKey);
         }
 
         [Function(nameof(DXFunction))]
-        public void Run([EventHubTrigger(
+        public async Task Run([EventHubTrigger(
             eventHubName: "iothub-ehub-mizobataka-56011127-6e264844b5",
             Connection = "mizobatakagakunamespace_RootManageSharedAccessKey_EVENTHUB"
         )] EventData[] events)
@@ -32,35 +41,62 @@ namespace Mizobata.Function
                 try
                 {
                     string json = @event.EventBody.ToString();
-
                     var doc = JsonDocument.Parse(json);
+
                     if (!doc.RootElement.TryGetProperty("machine_id", out var machineIdElement) ||
-                        machineIdElement.ValueKind != JsonValueKind.String ||
-                        !doc.RootElement.TryGetProperty("activate", out var activateElement) ||
-                        activateElement.ValueKind != JsonValueKind.String) {
-                        _logger.LogWarning("Invalid or missing 'machine_id' or 'activate' in payload.");
-                        return;
+                        !doc.RootElement.TryGetProperty("image_base64", out var imageElement)) {
+                        _logger.LogWarning("Missing 'machine_id' or 'image_base64' in event data.");
+                        continue;
                     }
 
                     string machineId = machineIdElement.GetString()!;
-                    string activate = activateElement.GetString()!;
+                    string imageBase64 = imageElement.GetString()!;
 
-                    _logger.LogInformation("Parsed machine_id: {machineId}, activate: {activate}", machineId, activate);
+                    // ML 推論リクエストの作成
+                    var mlRequestBody = new
+                    {
+                        image = imageBase64
+                    };
+                    var mlRequestJson = JsonSerializer.Serialize(mlRequestBody);
+                    var content = new StringContent(mlRequestJson, Encoding.UTF8, "application/json");
 
-                    using var conn = new SqlConnection(_connectionString);
-                    conn.Open();
+                    // MLエンドポイントに送信
+                    HttpResponseMessage response = await _httpClient.PostAsync(_mlEndpoint, content);
+                    response.EnsureSuccessStatusCode();
+                    string mlResponseJson = await response.Content.ReadAsStringAsync();
 
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "INSERT INTO OperationLogs (machine_id, activate) VALUES (@machine_id, @activate)";
-                    cmd.Parameters.AddWithValue("@machine_id", machineId);
-                    cmd.Parameters.AddWithValue("@activate", activate);
-                    cmd.ExecuteNonQuery();
+                    var mlResponse = JsonDocument.Parse(mlResponseJson);
 
-                    _logger.LogInformation("Inserted into SQL DB successfully.");
+                    if (!mlResponse.RootElement.TryGetProperty("predicted_class", out var classElement) || classElement.ValueKind != JsonValueKind.String) {
+                        _logger.LogWarning("Invalid or missing 'predicted_class' in ML response.");
+                        continue;
+                    }
+                    string predictedClass = classElement.GetString()!;
+                    _logger.LogInformation("ML predicted_class for machine {machineId}: {predictedClass}", machineId, predictedClass);
+
+                    if (!mlResponse.RootElement.TryGetProperty("result", out var resultElement) || resultElement.ValueKind != JsonValueKind.True && resultElement.ValueKind != JsonValueKind.False) {
+                        _logger.LogWarning("Invalid or missing 'result' in ML response.");
+                        continue;
+                    }
+
+                    bool isActivated = resultElement.GetBoolean();
+                    _logger.LogInformation("ML result for machine {machineId}: {result}", machineId, isActivated);
+
+                    if (predictedClass == "class1") {
+                        using var conn = new SqlConnection(_connectionString);
+                        conn.Open();
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = "INSERT INTO OperationLogs (machine_id, activate) VALUES (@machine_id, @activate)";
+                        cmd.Parameters.AddWithValue("@machine_id", machineId);
+                        cmd.Parameters.AddWithValue("@activate", isActivated ? "1" : "0");
+                        cmd.ExecuteNonQuery();
+
+                        _logger.LogInformation("Inserted into SQL DB for machine_id: {machineId}", machineId);
+                    }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to process and insert event.");
+                    _logger.LogError(ex, "Error processing EventHub message.");
                 }
             }
         }
