@@ -41,6 +41,8 @@ namespace Mizobata.Function
                 try
                 {
                     string json = @event.EventBody.ToString();
+                    _logger.LogInformation("Raw event body (truncated): {json}", json.Substring(0, Math.Min(json.Length, 300)));
+
                     var doc = JsonDocument.Parse(json);
 
                     if (!doc.RootElement.TryGetProperty("machine_id", out var machineIdElement) ||
@@ -93,6 +95,10 @@ namespace Mizobata.Function
 
                         _logger.LogInformation("Inserted into SQL DB for machine_id: {machineId}", machineId);
                     }
+                }
+                catch (JsonException jex)
+                {
+                    _logger.LogError(jex, "JSON parse failed");
                 }
                 catch (Exception ex)
                 {
