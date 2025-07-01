@@ -6,26 +6,23 @@ using Azure.Messaging.EventHubs;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 
-namespace Mizobata.Function
-{
-    public class DXFunction
-    {
+namespace Mizobata.Function {
+    public class DXFunction {
         private readonly ILogger<DXFunction> _logger;
         private readonly string? _connectionString;
         private readonly HttpClient _httpClient;
         private readonly string? _mlEndpoint;
         private readonly string? _mlApiKey;
 
-        public DXFunction(ILogger<DXFunction> logger)
-        {
+        public DXFunction(ILogger<DXFunction> logger) {
             _logger = logger;
             _connectionString = Environment.GetEnvironmentVariable("ADO_NET_CONNECTION");
             _mlEndpoint = Environment.GetEnvironmentVariable("ML_ENDPOINT_URL");
             _mlApiKey = Environment.GetEnvironmentVariable("ML_API_KEY");
 
-            if (string.IsNullOrEmpty(_connectionString) || string.IsNullOrEmpty(_mlEndpoint) || string.IsNullOrEmpty(_mlApiKey))
+            if (string.IsNullOrEmpty(_connectionString) || string.IsNullOrEmpty(_mlEndpoint) || string.IsNullOrEmpty(_mlApiKey)){
                 throw new InvalidOperationException("Missing required environment variables.");
-
+            }
             _httpClient = new HttpClient();
             _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _mlApiKey);
         }
@@ -34,19 +31,15 @@ namespace Mizobata.Function
         public async Task Run([EventHubTrigger(
             eventHubName: "iothub-ehub-mizobataka-56011127-6e264844b5",
             Connection = "mizobatakagakunamespace_RootManageSharedAccessKey_EVENTHUB"
-        )] EventData[] events)
-        {
-            foreach (EventData @event in events)
-            {
-                try
-                {
+        )] EventData[] events) {
+            foreach (EventData @event in events) {
+                try {
                     string json = @event.EventBody.ToString();
                     _logger.LogInformation("Raw event body (truncated): {json}", json.Substring(0, Math.Min(json.Length, 300)));
 
                     var doc = JsonDocument.Parse(json);
 
-                    if (!doc.RootElement.TryGetProperty("machine_id", out var machineIdElement) ||
-                        !doc.RootElement.TryGetProperty("image_base64", out var imageElement)) {
+                    if (!doc.RootElement.TryGetProperty("machine_id", out var machineIdElement) || !doc.RootElement.TryGetProperty("image_base64", out var imageElement)) {
                         _logger.LogWarning("Missing 'machine_id' or 'image_base64' in event data.");
                         continue;
                     }
@@ -55,8 +48,7 @@ namespace Mizobata.Function
                     string imageBase64 = imageElement.GetString()!;
 
                     // ML 推論リクエストの作成
-                    var mlRequestBody = new
-                    {
+                    var mlRequestBody = new {
                         image = imageBase64
                     };
                     var mlRequestJson = JsonSerializer.Serialize(mlRequestBody);
@@ -82,26 +74,54 @@ namespace Mizobata.Function
                     }
 
                     bool isActivated = resultElement.GetBoolean();
+                    string currentStatus = isActivated ? "1" : "0";
                     _logger.LogInformation("ML result for machine {machineId}: {result}", machineId, isActivated);
 
-                    if (predictedClass == "class1") {
-                        using var conn = new SqlConnection(_connectionString);
-                        conn.Open();
-                        using var cmd = conn.CreateCommand();
-                        cmd.CommandText = "INSERT INTO OperationLogs (machine_id, activate) VALUES (@machine_id, @activate)";
-                        cmd.Parameters.AddWithValue("@machine_id", machineId);
-                        cmd.Parameters.AddWithValue("@activate", isActivated ? "1" : "0");
-                        cmd.ExecuteNonQuery();
-
-                        _logger.LogInformation("Inserted into SQL DB for machine_id: {machineId}", machineId);
+                    // 過去状態を確認
+                    using var conn = new SqlConnection(_connectionString);
+                    await conn.OpenAsync();
+                    string? prevStatus = null;
+                    using (var selectCmd = conn.CreateCommand()) {
+                        selectCmd.CommandText = "SELECT activate FROM CurrentMachineStatus WHERE machine_id = @machine_id";
+                        selectCmd.Parameters.AddWithValue("@machine_id", machineId);
+                        var result = await selectCmd.ExecuteScalarAsync();
+                        if (result != null) {
+                            prevStatus = result.ToString();
+                        }
                     }
-                }
-                catch (JsonException jex)
-                {
+
+                    // 状態が変化したときだけ処理
+                    if (prevStatus != currentStatus) {
+                        // OperationLogs に挿入
+                        using (var logCmd = conn.CreateCommand()) {
+                            logCmd.CommandText = "INSERT INTO OperationLogs (machine_id, activate) VALUES (@machine_id, @activate)";
+                            logCmd.Parameters.AddWithValue("@machine_id", machineId);
+                            logCmd.Parameters.AddWithValue("@activate", currentStatus);
+                            await logCmd.ExecuteNonQueryAsync();
+                        }
+
+                        // CurrentMachineStatus を更新
+                        using (var upsertCmd = conn.CreateCommand()) {
+                            upsertCmd.CommandText = @"
+                                MERGE CurrentMachineStatus AS target
+                                USING (SELECT @machine_id AS machine_id, @activate AS activate) AS source
+                                ON target.machine_id = source.machine_id
+                                WHEN MATCHED THEN
+                                    UPDATE SET activate = @activate, updated_at = GETUTCDATE()
+                                WHEN NOT MATCHED THEN
+                                    INSERT (machine_id, activate, updated_at) VALUES (@machine_id, @activate, GETUTCDATE());";
+                            upsertCmd.Parameters.AddWithValue("@machine_id", machineId);
+                            upsertCmd.Parameters.AddWithValue("@activate", currentStatus);
+                            await upsertCmd.ExecuteNonQueryAsync();
+                        }
+
+                        _logger.LogInformation("Status changed. Inserted new record.");
+                    } else {
+                        _logger.LogInformation("No status change detected. Skipping DB insert.");
+                    }
+                } catch (JsonException jex) {
                     _logger.LogError(jex, "JSON parse failed");
-                }
-                catch (Exception ex)
-                {
+                } catch (Exception ex) {
                     _logger.LogError(ex, "Error processing EventHub message.");
                 }
             }
