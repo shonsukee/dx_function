@@ -5,6 +5,7 @@ using Microsoft.Data.SqlClient;
 using Azure.Messaging.EventHubs;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
+using Azure.Storage.Blobs;
 
 namespace Mizobata.Function {
     public class DXFunction {
@@ -13,14 +14,16 @@ namespace Mizobata.Function {
         private readonly HttpClient _httpClient;
         private readonly string? _mlEndpoint;
         private readonly string? _mlApiKey;
+        private readonly string? _blobConnectionString;
 
         public DXFunction(ILogger<DXFunction> logger) {
             _logger = logger;
             _connectionString = Environment.GetEnvironmentVariable("ADO_NET_CONNECTION");
             _mlEndpoint = Environment.GetEnvironmentVariable("ML_ENDPOINT_URL");
             _mlApiKey = Environment.GetEnvironmentVariable("ML_API_KEY");
+            _blobConnectionString = Environment.GetEnvironmentVariable("BLOB_CONNECTION_STRING")!;
 
-            if (string.IsNullOrEmpty(_connectionString) || string.IsNullOrEmpty(_mlEndpoint) || string.IsNullOrEmpty(_mlApiKey)){
+            if (string.IsNullOrEmpty(_connectionString) || string.IsNullOrEmpty(_mlEndpoint) || string.IsNullOrEmpty(_mlApiKey) || string.IsNullOrEmpty(_blobConnectionString)){
                 throw new InvalidOperationException("Missing required environment variables.");
             }
             _httpClient = new HttpClient();
@@ -71,6 +74,24 @@ namespace Mizobata.Function {
                     if (!mlResponse.RootElement.TryGetProperty("result", out var resultElement) || resultElement.ValueKind != JsonValueKind.True && resultElement.ValueKind != JsonValueKind.False) {
                         _logger.LogWarning("Invalid or missing 'result' in ML response.");
                         continue;
+                    }
+
+                    // 画像を保存
+                    string containerName = "images";
+                    string dateFolder = DateTime.UtcNow.ToString("yyyyMMdd");
+                    string subFolder = predictedClass == "class1" ? "on" : "off";
+                    string folderPath = $"uploads/{dateFolder}/{subFolder}";
+                    string fileName = $"{machineId}_{DateTime.UtcNow:HHmmssfff}.jpg";
+                    string fullBlobName = $"{folderPath}/{fileName}";
+                    byte[] imageBytes = Convert.FromBase64String(imageBase64);
+                    var blobContainerClient = new BlobContainerClient(_blobConnectionString, containerName);
+                    await blobContainerClient.CreateIfNotExistsAsync();
+                    await blobContainerClient.SetAccessPolicyAsync(Azure.Storage.Blobs.Models.PublicAccessType.None);
+
+                    BlobClient blob = blobContainerClient.GetBlobClient(fullBlobName);
+
+                    using (var stream = new MemoryStream(imageBytes)) {
+                        await blob.UploadAsync(stream, overwrite: true);
                     }
 
                     bool isActivated = resultElement.GetBoolean();
