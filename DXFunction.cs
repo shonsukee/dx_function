@@ -79,9 +79,10 @@ namespace Mizobata.Function {
                     // 画像を保存
                     string containerName = "images";
                     string dateFolder = DateTime.UtcNow.ToString("yyyyMMdd");
-                    string subFolder = predictedClass == "class1" ? "on" : "off";
+                    bool isPredicted = predictedClass == "class1";
+                    string subFolder = isPredicted ? "on" : "off";
                     string folderPath = $"uploads/{dateFolder}/{subFolder}";
-                    string fileName = $"{machineId}_{DateTime.UtcNow:HHmmssfff}.jpg";
+                    string fileName = isPredicted ? $"{machineId}_{DateTime.UtcNow:HHmmssfff}.jpg" : $"{machineId}_{DateTime.UtcNow:HHmmssfff}_{predictedClass}.jpg";
                     string fullBlobName = $"{folderPath}/{fileName}";
                     byte[] imageBytes = Convert.FromBase64String(imageBase64);
                     var blobContainerClient = new BlobContainerClient(_blobConnectionString, containerName);
